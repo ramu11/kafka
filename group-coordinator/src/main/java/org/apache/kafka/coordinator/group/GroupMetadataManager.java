@@ -157,6 +157,9 @@ import org.apache.kafka.coordinator.group.modern.share.ShareGroup.ShareGroupStat
 import org.apache.kafka.coordinator.group.modern.share.ShareGroupAssignmentBuilder;
 import org.apache.kafka.coordinator.group.modern.share.ShareGroupMember;
 import org.apache.kafka.coordinator.group.streams.AssignmentRefiner;
+import org.apache.kafka.coordinator.group.streams.ClassicStreamsAssignment;
+import org.apache.kafka.coordinator.group.streams.ClassicStreamsMemberMetadata;
+import org.apache.kafka.coordinator.group.streams.MemberTaskOffsets;
 import org.apache.kafka.coordinator.group.streams.NoOpAssignmentRefiner;
 import org.apache.kafka.coordinator.group.streams.StreamsCoordinatorRecordHelpers;
 import org.apache.kafka.coordinator.group.streams.StreamsGroup;
@@ -189,6 +192,7 @@ import org.slf4j.Logger;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -902,16 +906,13 @@ public class GroupMetadataManager {
     }
 
     /**
-     * Gets or creates a streams group without updating the groups map.
-     * The group will be materialized during the replay.
+     * Gets or creates a streams group without updating the groups map. The group will be materialized during replay.
      *
-     * If there is an empty classic consumer group of the same name, it will be deleted and a new streams
-     * group will be created.
+     * An empty classic group is deleted before creating a streams group. A non-empty classic group whose selected
+     * protocol is the legacy Streams assignor is converted to a streams group.
      *
-     * @param groupId           The group ID.
-     * @param records           The record list to which the group tombstones are written
-     *                          if the group is empty and is a classic group.
-     *
+     * @param groupId The group ID.
+     * @param records The records to append for group creation or conversion.
      * @return A StreamsGroup.
      *
      * Package private for testing.
@@ -920,6 +921,14 @@ public class GroupMetadataManager {
         String groupId,
         List<CoordinatorRecord> records
     ) {
+        return getOrCreateStreamsGroup(groupId, records, 0);
+    }
+
+    StreamsGroup getOrCreateStreamsGroup(
+        String groupId,
+        List<CoordinatorRecord> records,
+        int topologyEpoch
+    ) {
         Group group = groups.get(groupId);
 
         if (group == null) {
@@ -927,9 +936,93 @@ public class GroupMetadataManager {
         } else if (maybeDeleteEmptyClassicGroup(group, records)) {
             log.info("[GroupId {}] Converted the empty classic group to a streams group.", groupId);
             return new StreamsGroup(logContext, snapshotRegistry, groupId);
+        } else if (group.type() == CLASSIC &&
+            ((ClassicGroup) group).protocolName().filter("stream"::equals).isPresent()) {
+            return convertClassicStreamsGroup((ClassicGroup) group, records);
         } else {
             return castToStreamsGroup(group);
         }
+    }
+
+    /**
+     * Converts a classic-protocol Kafka Streams group to the streams group representation.
+     *
+     * @param classicGroup The classic Streams group.
+     * @param records The coordinator records to persist the conversion.
+     * @param topologyEpoch The topology epoch provided by the first member using the Streams protocol.
+     * @return The converted streams group, which will be materialized during record replay.
+     */
+    private StreamsGroup convertClassicStreamsGroup(
+        ClassicGroup classicGroup,
+        List<CoordinatorRecord> records
+    ) {
+        final String groupId = classicGroup.groupId();
+        final int groupEpoch = classicGroup.generationId();
+        final String protocolName = classicGroup.protocolName().orElse("stream");
+        final List<StreamsGroupMember> convertedMembers = new ArrayList<>(classicGroup.numMembers());
+
+        // Decode all members before appending any records or completing their pending futures. If one
+        // member carries incompatible metadata, the conversion is rejected without a partial mutation.
+        for (final ClassicGroupMember classicMember : classicGroup.allMembers()) {
+            try {
+                final ConsumerProtocolSubscription subscription =
+                    ConsumerProtocol.deserializeConsumerProtocolSubscription(
+                        ByteBuffer.wrap(classicMember.metadata(protocolName))
+                    );
+                if (subscription.userData() == null) {
+                    throw new SchemaException("Classic Streams subscription has no Streams member metadata.");
+                }
+                final ClassicStreamsMemberMetadata metadata =
+                    ClassicStreamsMemberMetadata.decode(subscription.userData());
+                final StreamsGroupMember convertedMember = metadata.toStreamsGroupMember(
+                    classicMember.memberId(),
+                    classicMember.groupInstanceId().orElse(null),
+                    subscription.rackId(),
+                    classicMember.clientId(),
+                    classicMember.clientHost(),
+                    classicMember.rebalanceTimeoutMs(),
+                    groupEpoch,
+                    -1
+                );
+                convertedMembers.add(new StreamsGroupMember.Builder(convertedMember)
+                    .setClassicSessionTimeoutMs(classicMember.sessionTimeoutMs())
+                    .setClassicProtocolMetadata(Base64.getEncoder().encodeToString(classicMember.metadata(protocolName)))
+                    .build());
+            } catch (final RuntimeException exception) {
+                throw new GroupIdNotFoundException(String.format(
+                    "Cannot convert classic Streams group %s because member %s has invalid Streams metadata.",
+                    groupId,
+                    classicMember.memberId()
+                ));
+            }
+        }
+
+        classicGroup.completeAllJoinFutures(Errors.REBALANCE_IN_PROGRESS);
+        classicGroup.completeAllSyncFutures(Errors.REBALANCE_IN_PROGRESS);
+        createGroupTombstoneRecordsAndCancelTimers(classicGroup, records);
+
+        final StreamsGroup streamsGroup = new StreamsGroup(logContext, snapshotRegistry, groupId);
+        streamsGroup.setGroupEpoch(groupEpoch);
+        records.add(newStreamsGroupMetadataRecord(
+            groupId,
+            groupEpoch,
+            0L,
+            -1,
+            AssignmentConfigsImpl.DEFAULT,
+            StreamsGroup.STORED_TOPOLOGY_EPOCH_NONE,
+            -1
+        ));
+
+        for (StreamsGroupMember member : convertedMembers) {
+            streamsGroup.updateMember(member);
+            records.add(newStreamsGroupMemberRecord(groupId, member));
+            records.add(newStreamsGroupCurrentAssignmentRecord(groupId, member));
+            scheduleStreamsGroupSessionTimeout(groupId, member.memberId());
+        }
+
+        log.info("[GroupId {}] Converted classic Streams group at generation {} to a streams group.",
+            groupId, groupEpoch);
+        return streamsGroup;
     }
 
     /**
@@ -2178,7 +2271,11 @@ public class GroupMetadataManager {
         }
 
         // 1. Create or update the member.
+        // A StreamsGroupHeartbeat is from the native Streams protocol. Clear the explicit classic migration marker,
+        // including when a native member reuses an ID previously held by a classic-protocol member.
         StreamsGroupMember.Builder updatedMemberBuilder = new StreamsGroupMember.Builder(member)
+            .setClassicSessionTimeoutMs(-1)
+            .setClassicProtocolMetadata(null)
             .maybeUpdateInstanceId(Optional.ofNullable(instanceId))
             .maybeUpdateRebalanceTimeoutMs(ofSentinel(rebalanceTimeoutMs))
             .maybeUpdateTopologyEpoch(topology != null ? OptionalInt.of(topology.epoch()) : OptionalInt.empty())
@@ -5232,19 +5329,120 @@ public class GroupMetadataManager {
     }
     
     /**
-     * Fences a member from a streams group.
-     *
-     * @param group     The group.
-     * @param member    The member.
-     * @param response  The response of the CoordinatorResult.
-     *
-     * @return The CoordinatorResult to be applied.
+     * Converts a streams group to a classic group when its last native Streams-protocol member leaves.
+     * All surviving members must be migrated classic Streams members with persisted classic metadata.
      */
+    private <T> CoordinatorResult<T, CoordinatorRecord> downgradeStreamsGroupAfterLastNativeMemberLeaves(
+        StreamsGroup group,
+        StreamsGroupMember leavingMember,
+        T response,
+        List<StreamsGroupMember> remainingMembers
+    ) {
+        final String groupId = group.groupId();
+        if (remainingMembers.isEmpty() || remainingMembers.stream().anyMatch(member -> !isClassicStreamsMember(member))) {
+            throw new IllegalArgumentException("Reverse migration requires only migrated classic Streams members to remain.");
+        }
+
+        final ClassicGroup classicGroup = new ClassicGroup(
+            logContext,
+            groupId,
+            ClassicGroupState.STABLE,
+            time,
+            group.groupEpoch(),
+            Optional.of(ConsumerProtocol.PROTOCOL_TYPE),
+            Optional.of("stream"),
+            Optional.of(remainingMembers.get(0).memberId()),
+            Optional.of(time.milliseconds())
+        );
+
+        try {
+            for (StreamsGroupMember streamsMember : remainingMembers) {
+                if (streamsMember.classicSessionTimeoutMs() == null || streamsMember.classicSessionTimeoutMs() <= 0 ||
+                    streamsMember.classicProtocolMetadata() == null || streamsMember.classicProtocolMetadata().isBlank()) {
+                    throw new GroupIdNotFoundException(String.format(
+                        "Cannot downgrade Streams group %s because classic metadata for member %s is missing.",
+                        groupId, streamsMember.memberId()));
+                }
+
+                final byte[] classicMetadata = Base64.getDecoder().decode(streamsMember.classicProtocolMetadata());
+                final JoinGroupRequestProtocolCollection protocols = new JoinGroupRequestProtocolCollection(1);
+                protocols.add(new JoinGroupRequestProtocol()
+                    .setName("stream")
+                    .setMetadata(classicMetadata));
+
+                final ClassicGroupMember classicMember = new ClassicGroupMember(
+                    streamsMember.memberId(),
+                    streamsMember.instanceId() == null ? Optional.empty() : streamsMember.instanceId(),
+                    streamsMember.clientId(),
+                    streamsMember.clientHost(),
+                    streamsMember.rebalanceTimeoutMs() == null ? -1 : streamsMember.rebalanceTimeoutMs(),
+                    streamsMember.classicSessionTimeoutMs(),
+                    ConsumerProtocol.PROTOCOL_TYPE,
+                    protocols
+                );
+                final short assignmentVersion = ConsumerProtocol.deserializeVersion(ByteBuffer.wrap(classicMetadata));
+                final StreamsGroupMember probingCandidate = classicStreamsProbingRebalanceCandidate(group);
+                final boolean scheduleProbingRebalance = probingCandidate != null &&
+                    probingCandidate.memberId().equals(streamsMember.memberId());
+                final org.apache.kafka.clients.consumer.ConsumerPartitionAssignor.Assignment assignment =
+                    ClassicStreamsAssignment.toConsumerAssignment(
+                        group,
+                        metadataImage,
+                        streamsMember.assignedTasks(),
+                        streamsMember.classicProtocolMetadata(),
+                        time.milliseconds(),
+                        scheduleProbingRebalance
+                    );
+                classicMember.setAssignment(ConsumerProtocol.serializeAssignment(assignment, assignmentVersion).array());
+                classicGroup.add(classicMember);
+            }
+        } catch (RuntimeException exception) {
+            if (exception instanceof GroupIdNotFoundException groupException) {
+                throw groupException;
+            }
+            throw new GroupIdNotFoundException(String.format(
+                "Cannot downgrade Streams group %s because its classic assignment could not be reconstructed: %s.",
+                groupId, exception.getMessage()));
+        }
+
+        classicGroup.setProtocolName(Optional.of("stream"));
+        classicGroup.setSubscribedTopics(classicGroup.computeSubscribedTopics());
+
+        final List<CoordinatorRecord> records = new ArrayList<>();
+        createGroupTombstoneRecordsAndCancelTimers(group, records);
+        group.members().keySet().forEach(memberId -> cancelTimers(groupId, memberId));
+
+        // Replace the in-memory type before scheduling timers or preparing the classic rebalance.
+        removeGroup(groupId);
+        groups.put(groupId, classicGroup);
+        classicGroup.allMembers().forEach(member -> rescheduleClassicGroupMemberHeartbeat(classicGroup, member));
+        prepareRebalance(classicGroup, String.format(
+            "Downgrade Streams group %s after its last Streams-protocol member %s left.", groupId, leavingMember.memberId()));
+        // Persist the state after the transition so replay also sees the pending classic rebalance.
+        classicGroup.createClassicGroupRecords(records);
+
+        log.info("[GroupId {}] Converted the Streams group back to a classic Streams group after member {} left.",
+            groupId, leavingMember.memberId());
+        // The in-memory group was already replaced with the prepared ClassicGroup above. The records must still
+        // be appended for durability and recovery, but replaying them again in this process would apply the
+        // Streams tombstones after the group type has changed to CLASSIC and fail with a type mismatch.
+        return new CoordinatorResult<>(records, response, null, false);
+    }
+
     private <T> CoordinatorResult<T, CoordinatorRecord> streamsGroupFenceMember(
         StreamsGroup group,
         StreamsGroupMember member,
         T response
     ) {
+        // Decide from the post-leave membership: if only migrated classic members remain, there are no native
+        // Streams members left and the group must return to the classic protocol. This is more robust than inferring
+        // the leaving member's protocol from a possibly stale marker during member-ID reuse/rejoin.
+        final List<StreamsGroupMember> remainingMembers = group.members().values().stream()
+            .filter(candidate -> !candidate.memberId().equals(member.memberId()))
+            .toList();
+        if (!remainingMembers.isEmpty() && remainingMembers.stream().allMatch(GroupMetadataManager::isClassicStreamsMember)) {
+            return downgradeStreamsGroupAfterLastNativeMemberLeaves(group, member, response, remainingMembers);
+        }
 
         List<CoordinatorRecord> records = new ArrayList<>(removeStreamsMember(group.groupId(), member.memberId()));
 
@@ -7145,6 +7343,9 @@ public class GroupMetadataManager {
                 // classicGroupJoinToConsumerGroup takes the join requests to non-empty consumer groups.
                 // The empty consumer groups should be converted to classic groups in classicGroupJoinToClassicGroup.
                 return cleanupNotNeeded(classicGroupJoinToConsumerGroup((ConsumerGroup) group, context, request, responseFuture));
+            } else if (group.type() == STREAMS && !group.isEmpty()) {
+                return cleanupNotNeeded(classicGroupJoinToStreamsGroup(
+                    (StreamsGroup) group, context, request, responseFuture));
             } else if (group.type() == CONSUMER || group.type() == CLASSIC || group.type() == STREAMS && group.isEmpty()) {
                 // classicGroupJoinToClassicGroup accepts:
                 // - classic groups
@@ -7173,6 +7374,295 @@ public class GroupMetadataManager {
         CoordinatorResult<Void, CoordinatorRecord> r
     ) {
         return new CoordinatorResult<>(r.records(), Boolean.FALSE, r.appendFuture(), r.replayRecords(), r.isAtomic());
+    }
+
+    /**
+     * The classic Streams protocol has no warm-up task role: it reports warm-up tasks as standby tasks.
+     * Preserve the Streams coordinator's warm-up role when interpreting that ownership report, otherwise a standby
+     * report would not acknowledge a warm-up revocation.
+     */
+    private static TasksTuple normalizeClassicStreamsOwnedTasks(
+        StreamsGroupMember member,
+        TasksTuple reportedOwnedTasks
+    ) {
+        final Map<String, Set<Integer>> warmupCandidates = new HashMap<>();
+        member.assignedTasks().warmupTasks().forEach((subtopologyId, partitions) ->
+            warmupCandidates.put(subtopologyId, new HashSet<>(partitions))
+        );
+        member.tasksPendingRevocation().warmupTasks().forEach((subtopologyId, partitions) ->
+            warmupCandidates.computeIfAbsent(subtopologyId, __ -> new HashSet<>()).addAll(partitions)
+        );
+
+        final Map<String, Set<Integer>> normalizedStandbyTasks = new HashMap<>();
+        final Map<String, Set<Integer>> normalizedWarmupTasks = new HashMap<>();
+        reportedOwnedTasks.warmupTasks().forEach((subtopologyId, partitions) ->
+            normalizedWarmupTasks.put(subtopologyId, new HashSet<>(partitions))
+        );
+
+        reportedOwnedTasks.standbyTasks().forEach((subtopologyId, partitions) -> {
+            final Set<Integer> reportedWarmupPartitions = new HashSet<>(partitions);
+            reportedWarmupPartitions.retainAll(warmupCandidates.getOrDefault(subtopologyId, Set.of()));
+            if (!reportedWarmupPartitions.isEmpty()) {
+                normalizedWarmupTasks.computeIfAbsent(subtopologyId, __ -> new HashSet<>())
+                    .addAll(reportedWarmupPartitions);
+            }
+
+            final Set<Integer> remainingStandbyPartitions = new HashSet<>(partitions);
+            remainingStandbyPartitions.removeAll(reportedWarmupPartitions);
+            if (!remainingStandbyPartitions.isEmpty()) {
+                normalizedStandbyTasks.put(subtopologyId, remainingStandbyPartitions);
+            }
+        });
+
+        return new TasksTuple(
+            reportedOwnedTasks.activeTasks(),
+            normalizedStandbyTasks,
+            normalizedWarmupTasks
+        );
+    }
+
+    /**
+     * Handles JoinGroup for a legacy Streams member after the classic group has been converted.
+     *
+     * <p>The Streams coordinator owns the assignment, so each known legacy member receives a
+     * synthetic single-member view. For JoinGroup v9, SkipAssignment prevents the client from
+     * running a competing local assignor; SyncGroup returns the broker-computed assignment.
+     */
+    @SuppressWarnings("NPathComplexity")
+    private CoordinatorResult<Void, CoordinatorRecord> classicGroupJoinToStreamsGroup(
+        StreamsGroup group,
+        AuthorizableRequestContext context,
+        JoinGroupRequestData request,
+        CompletableFuture<JoinGroupResponseData> responseFuture
+    ) {
+        final String memberId = request.memberId();
+        JoinGroupRequestProtocol selectedProtocol = null;
+        for (JoinGroupRequestProtocol protocol : request.protocols()) {
+            if ("stream".equals(protocol.name())) {
+                selectedProtocol = protocol;
+                break;
+            }
+        }
+
+        if (!ConsumerProtocol.PROTOCOL_TYPE.equals(request.protocolType()) || selectedProtocol == null) {
+            responseFuture.complete(new JoinGroupResponseData()
+                .setMemberId(UNKNOWN_MEMBER_ID)
+                .setErrorCode(Errors.INCONSISTENT_GROUP_PROTOCOL.code())
+                .setGenerationId(-1)
+                .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+                .setProtocolName("stream")
+                .setLeader(UNKNOWN_MEMBER_ID)
+                .setMembers(List.of()));
+            return EMPTY_RESULT;
+        }
+
+        final StreamsGroupMember member;
+        final ClassicStreamsMemberMetadata classicMetadata;
+        try {
+            member = group.getMemberOrThrow(memberId);
+            if (!isClassicStreamsMember(member)) {
+                throw new UnknownMemberIdException(String.format(
+                    "Member %s is not a classic-protocol member of Streams group %s.", memberId, group.groupId()));
+            }
+            if (!Objects.equals(member.instanceId().orElse(null), request.groupInstanceId())) {
+                responseFuture.complete(new JoinGroupResponseData()
+                    .setMemberId(UNKNOWN_MEMBER_ID)
+                    .setErrorCode(Errors.FENCED_INSTANCE_ID.code())
+                    .setGenerationId(-1)
+                    .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+                    .setProtocolName("stream")
+                    .setLeader(UNKNOWN_MEMBER_ID)
+                    .setMembers(List.of()));
+                return EMPTY_RESULT;
+            }
+
+            final ConsumerProtocolSubscription subscription = ConsumerProtocol.deserializeConsumerProtocolSubscription(
+                ByteBuffer.wrap(selectedProtocol.metadata()));
+            if (subscription.userData() == null) {
+                throw new SchemaException("Classic Streams subscription has no Streams member metadata.");
+            }
+            classicMetadata = ClassicStreamsMemberMetadata.decode(subscription.userData());
+        } catch (UnknownMemberIdException exception) {
+            responseFuture.complete(new JoinGroupResponseData()
+                .setMemberId(UNKNOWN_MEMBER_ID)
+                .setErrorCode(Errors.UNKNOWN_MEMBER_ID.code())
+                .setGenerationId(-1)
+                .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+                .setProtocolName("stream")
+                .setLeader(UNKNOWN_MEMBER_ID)
+                .setMembers(List.of()));
+            return EMPTY_RESULT;
+        } catch (RuntimeException exception) {
+            responseFuture.complete(new JoinGroupResponseData()
+                .setMemberId(UNKNOWN_MEMBER_ID)
+                .setErrorCode(Errors.INCONSISTENT_GROUP_PROTOCOL.code())
+                .setGenerationId(-1)
+                .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+                .setProtocolName("stream")
+                .setLeader(UNKNOWN_MEMBER_ID)
+                .setMembers(List.of()));
+            return EMPTY_RESULT;
+        }
+
+        final int assignmentEpoch = group.assignmentEpoch();
+        if (assignmentEpoch < group.groupEpoch()) {
+            responseFuture.complete(new JoinGroupResponseData()
+                .setMemberId(memberId)
+                .setErrorCode(Errors.REBALANCE_IN_PROGRESS.code())
+                .setGenerationId(-1)
+                .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+                .setProtocolName("stream")
+                .setLeader(UNKNOWN_MEMBER_ID)
+                .setMembers(List.of()));
+            return EMPTY_RESULT;
+        }
+
+        final TasksTuple targetAssignment = group.targetAssignment(memberId, member.instanceId());
+        final StreamsGroupMember probingCandidate = classicStreamsProbingRebalanceCandidate(group);
+        final boolean completesProbingRebalance = assignmentEpoch == group.groupEpoch() &&
+            probingCandidate != null && probingCandidate.memberId().equals(memberId);
+
+        // The classic member's JoinGroup metadata is the authoritative report of the tasks it still owns.
+        // Preserve the coordinator's current assignment (including warm-up roles and pending revocations).
+        // The JoinGroup metadata is used as the ownership acknowledgement by the reconciler below.
+        final StreamsGroupMember ownershipUpdatedMember = new StreamsGroupMember.Builder(member)
+            .setRebalanceTimeoutMs(request.rebalanceTimeoutMs())
+            .setClientId(context.clientId())
+            .setClientHost(context.clientAddress().toString())
+            .setProcessId(classicMetadata.processId())
+            .setClientTags(classicMetadata.clientTags())
+            .setClassicSessionTimeoutMs(request.sessionTimeoutMs())
+            .setClassicProtocolMetadata(Base64.getEncoder().encodeToString(selectedProtocol.metadata()))
+            // A successful JoinGroup refreshes this member's classic Streams metadata. If it was the selected
+            // probing member for the current assignment epoch, this JoinGroup satisfies the one-shot probe.
+            .setClassicProbingRebalanceEpoch(completesProbingRebalance
+                ? assignmentEpoch
+                : member.classicProbingRebalanceEpoch())
+            .setClassicProbingRebalancePending(false)
+            .build();
+        final StreamsGroupMember updatedMember = new org.apache.kafka.coordinator.group.streams.CurrentAssignmentBuilder(
+            ownershipUpdatedMember
+        )
+            .withTargetAssignment(assignmentEpoch, targetAssignment)
+            .withCurrentActiveTaskProcessId(group::currentActiveTaskProcessId)
+            .withCurrentStandbyTaskProcessIds(group::currentStandbyTaskProcessIds)
+            .withCurrentWarmupTaskProcessIds(group::currentWarmupTaskProcessIds)
+            .withOwnedAssignment(normalizeClassicStreamsOwnedTasks(ownershipUpdatedMember, classicMetadata.ownedTasks()))
+            .build();
+        // Classic SubscriptionInfo reports offset sums but no task end offsets. Retain only actual sums
+        // for the assignor's sticky-placement decisions; never derive a warm-up lag from missing end offsets.
+        group.updateTaskOffsets(memberId, toMemberTaskOffsets(classicMetadata));
+        group.updateMember(updatedMember);
+        final List<CoordinatorRecord> records = List.of(
+            newStreamsGroupMemberRecord(group.groupId(), updatedMember),
+            newStreamsGroupCurrentAssignmentRecord(group.groupId(), updatedMember));
+        scheduleStreamsGroupSessionTimeout(group.groupId(), memberId);
+
+        final JoinGroupResponseData response = new JoinGroupResponseData()
+            .setMemberId(memberId)
+            .setErrorCode(Errors.NONE.code())
+            .setGenerationId(updatedMember.memberEpoch())
+            .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+            .setProtocolName("stream")
+            .setLeader(memberId)
+            .setSkipAssignment(JoinGroupRequest.supportsSkippingAssignment(context.requestVersion()))
+            .setMembers(List.of(new JoinGroupResponseData.JoinGroupResponseMember()
+                .setMemberId(memberId)
+                .setGroupInstanceId(request.groupInstanceId())
+                .setMetadata(selectedProtocol.metadata())));
+
+        final CompletableFuture<Void> appendFuture = new CompletableFuture<>();
+        appendFuture.whenComplete((__, exception) -> {
+            if (exception == null) {
+                responseFuture.complete(response);
+            } else {
+                responseFuture.complete(new JoinGroupResponseData()
+                    .setMemberId(UNKNOWN_MEMBER_ID)
+                    .setErrorCode(Errors.forException(exception).code())
+                    .setGenerationId(-1)
+                    .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+                    .setProtocolName("stream")
+                    .setLeader(UNKNOWN_MEMBER_ID)
+                    .setMembers(List.of()));
+            }
+        });
+        return new CoordinatorResult<>(records, appendFuture, false);
+    }
+
+    /**
+     * Identifies a member migrated from the classic Kafka Streams protocol.
+     *
+     * <p>A negative topology epoch alone is insufficient because a newly created Streams member also starts
+     * with topology epoch {@code -1}. Classic Streams subscription metadata, however, includes a non-empty
+     * process ID. Requiring both avoids routing an uninitialized Streams member through the classic bridge.
+     */
+    private static boolean isClassicStreamsMember(final StreamsGroupMember member) {
+        // This persisted pair is the explicit migration marker. Do not infer protocol identity from topologyEpoch:
+        // native members can update topology independently, and member IDs may be reused across protocol changes.
+        return member.classicSessionTimeoutMs() != null &&
+            member.classicSessionTimeoutMs() > 0 &&
+            member.classicProtocolMetadata() != null &&
+            !member.classicProtocolMetadata().isBlank();
+    }
+
+    /**
+     * Selects one classic-protocol Streams member to trigger a probing rebalance when classic members currently own
+     * warm-up tasks. Lexicographic member-ID ordering makes the choice deterministic across coordinator failover.
+     * The current assignment must be available; otherwise a normal assignment-triggered rejoin is already pending.
+     */
+    private static StreamsGroupMember classicStreamsProbingRebalanceCandidate(final StreamsGroup group) {
+        if (group.assignmentEpoch() < group.groupEpoch()) {
+            return null;
+        }
+
+        // KIP-1071's special probing rebalance is needed when a classic-protocol member itself holds
+        // a warm-up task. That task is exposed to the legacy client as a standby task, so the coordinator
+        // must request a rejoin from one such member to refresh its classic Streams subscription metadata.
+        // A warm-up task held only by a native Streams member is not, by itself, a reason to probe an
+        // arbitrary classic member; ordinary assignment changes already trigger their own rejoin path.
+        return group.members().values().stream()
+            .filter(GroupMetadataManager::isClassicStreamsMember)
+            .filter(member -> !member.assignedTasks().warmupTasks().isEmpty())
+            .min((left, right) -> left.memberId().compareTo(right.memberId()))
+            .orElse(null);
+    }
+
+    /**
+     * Converts classic Streams subscription task-offset sums into the transient telemetry passed to the Streams
+     * assignor. The classic protocol uses negative sentinels for active tasks and unknown sums; these are not offsets.
+     * Known v12 end-offset sums are forwarded, while absent or overflowed sums remain unknown.
+     */
+    private static MemberTaskOffsets toMemberTaskOffsets(ClassicStreamsMemberMetadata metadata) {
+        final Map<String, Map<Integer, Long>> taskOffsets = new HashMap<>();
+        metadata.taskOffsetSums().forEach((subtopologyId, offsets) -> {
+            final Map<Integer, Long> knownOffsets = offsets.entrySet().stream()
+                .filter(entry -> entry.getValue() >= 0L)
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+            if (!knownOffsets.isEmpty()) {
+                taskOffsets.put(subtopologyId, knownOffsets);
+            }
+        });
+        final Map<String, Map<Integer, Long>> taskEndOffsets = new HashMap<>();
+        metadata.taskEndOffsetSums().forEach((subtopologyId, offsets) -> {
+            final Map<Integer, Long> knownEndOffsets = offsets.entrySet().stream()
+                // Long.MAX_VALUE represents unknown/overflowed end offsets and must never count as caught up.
+                .filter(entry -> entry.getValue() >= 0L && entry.getValue() < Long.MAX_VALUE)
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+            if (!knownEndOffsets.isEmpty()) {
+                taskEndOffsets.put(subtopologyId, knownEndOffsets);
+            }
+        });
+        return new MemberTaskOffsets(taskOffsets, taskEndOffsets);
+    }
+
+    private static TasksTupleWithEpochs classicTasksWithEpochs(TasksTuple assignment, int assignmentEpoch) {
+        final Map<String, Map<Integer, Integer>> activeTasksWithEpochs = new HashMap<>();
+        assignment.activeTasks().forEach((subtopologyId, partitions) -> {
+            final Map<Integer, Integer> partitionsWithEpochs = new HashMap<>();
+            partitions.forEach(partition -> partitionsWithEpochs.put(partition, assignmentEpoch));
+            activeTasksWithEpochs.put(subtopologyId, partitionsWithEpochs);
+        });
+        return new TasksTupleWithEpochs(activeTasksWithEpochs, assignment.standbyTasks(), assignment.warmupTasks());
     }
 
     /**
@@ -8403,11 +8893,82 @@ public class GroupMetadataManager {
             return classicGroupSyncToClassicGroup((ClassicGroup) group, context, request, responseFuture);
         } else if (group.type() == CONSUMER) {
             return classicGroupSyncToConsumerGroup((ConsumerGroup) group, context, request, responseFuture);
+        } else if (group.type() == STREAMS) {
+            return classicGroupSyncToStreamsGroup((StreamsGroup) group, request, responseFuture);
         } else {
             responseFuture.complete(new SyncGroupResponseData()
                 .setErrorCode(Errors.UNKNOWN_MEMBER_ID.code()));
             return EMPTY_RESULT;
         }
+    }
+
+    /**
+     * Handles SyncGroup for a migrated classic Streams member by returning the broker-computed assignment.
+     */
+    private CoordinatorResult<Void, CoordinatorRecord> classicGroupSyncToStreamsGroup(
+        StreamsGroup group,
+        SyncGroupRequestData request,
+        CompletableFuture<SyncGroupResponseData> responseFuture
+    ) {
+        final StreamsGroupMember member;
+        try {
+            member = group.getMemberOrThrow(request.memberId());
+        } catch (UnknownMemberIdException exception) {
+            responseFuture.complete(new SyncGroupResponseData().setErrorCode(Errors.UNKNOWN_MEMBER_ID.code()));
+            return EMPTY_RESULT;
+        }
+
+        if (!isClassicStreamsMember(member)) {
+            responseFuture.complete(new SyncGroupResponseData().setErrorCode(Errors.UNKNOWN_MEMBER_ID.code()));
+            return EMPTY_RESULT;
+        }
+        if (!Objects.equals(member.instanceId().orElse(null), request.groupInstanceId())) {
+            responseFuture.complete(new SyncGroupResponseData().setErrorCode(Errors.FENCED_INSTANCE_ID.code()));
+            return EMPTY_RESULT;
+        }
+        if (request.generationId() != member.memberEpoch()) {
+            responseFuture.complete(new SyncGroupResponseData().setErrorCode(Errors.ILLEGAL_GENERATION.code()));
+            return EMPTY_RESULT;
+        }
+        if ((request.protocolType() != null && !ConsumerProtocol.PROTOCOL_TYPE.equals(request.protocolType())) ||
+            (request.protocolName() != null && !"stream".equals(request.protocolName()))) {
+            responseFuture.complete(new SyncGroupResponseData()
+                .setErrorCode(Errors.INCONSISTENT_GROUP_PROTOCOL.code()));
+            return EMPTY_RESULT;
+        }
+
+        final byte[] assignmentBytes;
+        try {
+            final StreamsGroupMember probingCandidate = classicStreamsProbingRebalanceCandidate(group);
+            final boolean scheduleProbingRebalance = probingCandidate != null &&
+                probingCandidate.memberId().equals(member.memberId());
+            assignmentBytes = ConsumerProtocol.serializeAssignment(
+                ClassicStreamsAssignment.toConsumerAssignment(
+                    group,
+                    metadataImage,
+                    member.assignedTasks(),
+                    member.classicProtocolMetadata(),
+                    time.milliseconds(),
+                    scheduleProbingRebalance
+                )
+            ).array();
+        } catch (ClassicStreamsAssignment.AssignmentNotReadyException exception) {
+            responseFuture.complete(new SyncGroupResponseData()
+                .setErrorCode(Errors.REBALANCE_IN_PROGRESS.code()));
+            return EMPTY_RESULT;
+        } catch (SchemaException exception) {
+            responseFuture.complete(new SyncGroupResponseData()
+                .setErrorCode(Errors.INCONSISTENT_GROUP_PROTOCOL.code()));
+            return EMPTY_RESULT;
+        }
+
+        scheduleStreamsGroupSessionTimeout(group.groupId(), member.memberId());
+        responseFuture.complete(new SyncGroupResponseData()
+            .setErrorCode(Errors.NONE.code())
+            .setProtocolType(ConsumerProtocol.PROTOCOL_TYPE)
+            .setProtocolName("stream")
+            .setAssignment(assignmentBytes));
+        return EMPTY_RESULT;
     }
 
     /**
@@ -8663,11 +9224,81 @@ public class GroupMetadataManager {
             return classicGroupHeartbeatToClassicGroup((ClassicGroup) group, context, request);
         } else if (group.type() == CONSUMER) {
             return classicGroupHeartbeatToConsumerGroup((ConsumerGroup) group, context, request);
+        } else if (group.type() == STREAMS) {
+            return classicGroupHeartbeatToStreamsGroup((StreamsGroup) group, request);
         } else {
             throw new UnknownMemberIdException(
                 String.format("Group %s not found.", request.groupId())
             );
         }
+    }
+
+    /**
+     * Handles a classic Heartbeat request from a legacy Streams-protocol member after its group
+     * has been converted to a Streams group.
+     *
+     * @param group The migrated Streams group.
+     * @param request The classic Heartbeat request.
+     * @return A heartbeat response that requests a rejoin while the member assignment is stale.
+     */
+    private CoordinatorResult<HeartbeatResponseData, CoordinatorRecord> classicGroupHeartbeatToStreamsGroup(
+        StreamsGroup group,
+        HeartbeatRequestData request
+    ) {
+        final StreamsGroupMember member = group.getMemberOrThrow(request.memberId());
+
+        // Do not identify a legacy member from topology epoch alone; uninitialized Streams members also
+        // have a negative topology epoch. The shared predicate also validates the legacy process ID.
+        if (!isClassicStreamsMember(member)) {
+            throw new UnknownMemberIdException(String.format(
+                "Member %s is not a classic-protocol member of Streams group %s.",
+                request.memberId(), request.groupId()
+            ));
+        }
+
+        if (!Objects.equals(member.instanceId().orElse(null), request.groupInstanceId())) {
+            throw new FencedInstanceIdException(String.format(
+                "Group instance id %s does not match the migrated member %s.",
+                request.groupInstanceId(), request.memberId()
+            ));
+        }
+
+        if (request.generationId() != member.memberEpoch()) {
+            throw ILLEGAL_GENERATION.exception();
+        }
+
+        // Keep the old client alive even before it has rejoined with the epoch returned by JoinGroup.
+        scheduleStreamsGroupSessionTimeout(group.groupId(), member.memberId());
+
+        if (member.memberEpoch() < group.groupEpoch() ||
+            member.state() != org.apache.kafka.coordinator.group.streams.MemberState.STABLE) {
+            return new CoordinatorResult<>(List.of(), new HeartbeatResponseData()
+                .setErrorCode(Errors.REBALANCE_IN_PROGRESS.code()));
+        }
+
+        // A probing rebalance is a one-shot request for an eligible classic Streams member. Keep returning
+        // REBALANCE_IN_PROGRESS until that member rejoins, but do not trigger every classic member or every
+        // heartbeat in the same assignment epoch.
+        if (member.classicProbingRebalancePending()) {
+            return new CoordinatorResult<>(List.of(), new HeartbeatResponseData()
+                .setErrorCode(Errors.REBALANCE_IN_PROGRESS.code()));
+        }
+
+        final StreamsGroupMember probingCandidate = classicStreamsProbingRebalanceCandidate(group);
+        if (probingCandidate != null && probingCandidate.memberId().equals(member.memberId()) &&
+            member.classicProbingRebalanceEpoch() < group.assignmentEpoch()) {
+            final StreamsGroupMember updatedMember = new StreamsGroupMember.Builder(member)
+                .setClassicProbingRebalanceEpoch(group.assignmentEpoch())
+                .setClassicProbingRebalancePending(true)
+                .build();
+            group.updateMember(updatedMember);
+            return new CoordinatorResult<>(
+                List.of(newStreamsGroupMemberRecord(group.groupId(), updatedMember)),
+                new HeartbeatResponseData().setErrorCode(Errors.REBALANCE_IN_PROGRESS.code())
+            );
+        }
+
+        return new CoordinatorResult<>(List.of(), new HeartbeatResponseData());
     }
 
     /**
@@ -9120,19 +9751,84 @@ public class GroupMetadataManager {
             return classicGroupLeaveToClassicGroup((ClassicGroup) group, request);
         } else if (group.type() == CONSUMER) {
             return classicGroupLeaveToConsumerGroup((ConsumerGroup) group, request);
+        } else if (group.type() == STREAMS) {
+            return classicGroupLeaveToStreamsGroup((StreamsGroup) group, request);
         } else {
             throw new UnknownMemberIdException(String.format("Group %s not found.", request.groupId()));
         }
     }
 
     /**
-     * Handle a classic LeaveGroupRequest to a ConsumerGroup.
-     *
-     * @param group          The ConsumerGroup.
-     * @param request        The actual LeaveGroup request.
-     *
-     * @return The LeaveGroup response and the records to append.
+     * Handles LeaveGroup from a migrated classic Streams member while the group uses the Streams coordinator.
      */
+    private CoordinatorResult<LeaveGroupResponseData, CoordinatorRecord> classicGroupLeaveToStreamsGroup(
+        StreamsGroup group,
+        LeaveGroupRequestData request
+    ) {
+        final List<MemberResponse> memberResponses = new ArrayList<>();
+        final Set<StreamsGroupMember> validMembers = new HashSet<>();
+
+        for (MemberIdentity identity : request.members()) {
+            try {
+                final StreamsGroupMember member;
+                if (identity.groupInstanceId() == null) {
+                    member = group.getMemberOrThrow(identity.memberId());
+                    if (member.instanceId() != null && member.instanceId().isPresent()) {
+                        throw new FencedInstanceIdException(String.format(
+                            "Static member %s must include its group instance id in LeaveGroup.", identity.memberId()));
+                    }
+                } else {
+                    member = group.staticMember(identity.groupInstanceId());
+                    throwIfStaticMemberIsUnknown(member, identity.groupInstanceId());
+                    if (!UNKNOWN_MEMBER_ID.equals(identity.memberId())) {
+                        throwIfInstanceIdIsFenced(member, group.groupId(), identity.memberId(), identity.groupInstanceId());
+                    }
+                }
+
+                if (!isClassicStreamsMember(member)) {
+                    throw new UnknownMemberIdException(String.format(
+                        "Member %s is not a migrated classic Streams member of group %s.", identity.memberId(), group.groupId()));
+                }
+                validMembers.add(member);
+                memberResponses.add(new MemberResponse()
+                    .setMemberId(identity.memberId())
+                    .setGroupInstanceId(identity.groupInstanceId()));
+                log.info("[GroupId {}] Migrated classic Streams member {} left through LeaveGroup; reason: {}.",
+                    group.groupId(), member.memberId(), identity.reason() == null ? "not provided" : identity.reason());
+            } catch (KafkaException exception) {
+                memberResponses.add(new MemberResponse()
+                    .setMemberId(identity.memberId())
+                    .setGroupInstanceId(identity.groupInstanceId())
+                    .setErrorCode(Errors.forException(exception).code()));
+            }
+        }
+
+        if (validMembers.isEmpty()) {
+            return new CoordinatorResult<>(List.of(), new LeaveGroupResponseData().setMembers(memberResponses));
+        }
+
+        final List<CoordinatorRecord> records = new ArrayList<>();
+        for (StreamsGroupMember member : validMembers) {
+            records.addAll(removeStreamsMember(group.groupId(), member.memberId()));
+            cancelTimers(group.groupId(), member.memberId());
+        }
+
+        final int groupEpoch = group.groupEpoch() + 1;
+        records.add(newStreamsGroupMetadataRecord(
+            group.groupId(),
+            groupEpoch,
+            group.metadataHash(),
+            group.validatedTopologyEpoch(),
+            group.lastAssignmentConfigs(),
+            group.storedDescriptionTopologyEpoch(),
+            group.failedDescriptionTopologyEpoch()
+        ));
+        if (validMembers.size() == group.members().size()) {
+            records.add(newStreamsGroupTargetAssignmentMetadataRecord(group.groupId(), groupEpoch, 0L));
+        }
+        return new CoordinatorResult<>(records, new LeaveGroupResponseData().setMembers(memberResponses));
+    }
+
     private CoordinatorResult<LeaveGroupResponseData, CoordinatorRecord> classicGroupLeaveToConsumerGroup(
         ConsumerGroup group,
         LeaveGroupRequestData request

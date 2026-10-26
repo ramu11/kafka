@@ -26553,6 +26553,33 @@ public class GroupMetadataManagerTest {
     }
 
     @Test
+    public void testClassicGroupHeartbeatOnUninitializedStreamsMember() {
+        String groupId = "group-foo";
+        String memberId = Uuid.randomUuid().toString();
+
+        GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder()
+            .withMetadataImage(CoordinatorMetadataImage.EMPTY)
+            .withStreamsGroup(new StreamsGroupBuilder(groupId, 1)
+                .withMember(StreamsGroupMember.Builder.withDefaults(memberId)
+                    .setState(org.apache.kafka.coordinator.group.streams.MemberState.STABLE)
+                    .setMemberEpoch(1)
+                    .setPreviousMemberEpoch(0)
+                    .setProcessId(Uuid.randomUuid().toString())
+                    .setClientId(DEFAULT_CLIENT_ID)
+                    .setClientHost(DEFAULT_CLIENT_ADDRESS.toString())
+                    .build())
+                .withTargetAssignment(memberId, TasksTuple.EMPTY)
+                .withTargetAssignmentEpoch(1))
+            .build();
+
+        assertThrows(UnknownMemberIdException.class, () -> context.sendClassicGroupHeartbeat(
+            new HeartbeatRequestData()
+                .setGroupId(groupId)
+                .setMemberId(memberId)
+                .setGenerationId(1)));
+    }
+
+    @Test
     public void testClassicGroupLeaveOnStreamsGroup() throws Exception {
         String groupId = "group-foo";
         String memberId = Uuid.randomUuid().toString();
@@ -26571,12 +26598,12 @@ public class GroupMetadataManagerTest {
                 .withTargetAssignmentEpoch(1))
             .build();
 
-        assertThrows(UnknownMemberIdException.class, () -> context.sendClassicGroupLeave(
+        CoordinatorResult<LeaveGroupResponseData, CoordinatorRecord> leaveResult = context.sendClassicGroupLeave(
             new LeaveGroupRequestData()
                 .setGroupId(groupId)
-                .setMembers(List.of(
-                    new MemberIdentity()
-                        .setMemberId(memberId)))));
+                .setMembers(List.of(new MemberIdentity().setMemberId(memberId))));
+        assertTrue(leaveResult.records().isEmpty());
+        assertTrue(leaveResult.response().members().get(0).errorCode() == Errors.UNKNOWN_MEMBER_ID.code());
     }
 
     @Test

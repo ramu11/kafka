@@ -19,7 +19,9 @@ package org.apache.kafka.streams.integration;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.ListGroupsOptions;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.GroupType;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -47,6 +49,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 
 import static java.util.Collections.singletonList;
 import static org.apache.kafka.streams.integration.utils.IntegrationTestUtils.waitForEmptyConsumerGroup;
@@ -160,6 +163,95 @@ public class RebalanceProtocolMigrationIntegrationTest {
 
         props.put(StreamsConfig.GROUP_PROTOCOL_CONFIG, GroupProtocol.STREAMS.name());
         processExactlyOneRecord(streamsBuilder, props, "3", "C");
+    }
+
+    @Test
+    public void shouldMigrateToStreamsProtocolWhileClassicClientRemainsRunning() throws Exception {
+        final StreamsBuilder streamsBuilder = new StreamsBuilder();
+        final KStream<String, String> input = streamsBuilder.stream(
+            inputTopic, Consumed.with(Serdes.String(), Serdes.String()));
+        input.to(outputTopic, Produced.with(Serdes.String(), Serdes.String()));
+
+        final Properties classicProps = props();
+        classicProps.put(StreamsConfig.GROUP_PROTOCOL_CONFIG, GroupProtocol.CLASSIC.name());
+        classicProps.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getAbsolutePath());
+
+        final Properties streamsProps = props();
+        streamsProps.put(StreamsConfig.GROUP_PROTOCOL_CONFIG, GroupProtocol.STREAMS.name());
+        streamsProps.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getAbsolutePath());
+
+        final String applicationId = classicProps.getProperty(StreamsConfig.APPLICATION_ID_CONFIG);
+        final KafkaStreams classicStreams = new KafkaStreams(streamsBuilder.build(), classicProps);
+        final KafkaStreams streams = new KafkaStreams(streamsBuilder.build(), streamsProps);
+        boolean streamsClosed = false;
+
+        try {
+            classicStreams.start();
+            TestUtils.waitForCondition(
+                () -> classicStreams.state() == KafkaStreams.State.RUNNING,
+                30_000L,
+                "Classic-protocol Streams application did not reach RUNNING state."
+            );
+
+            try (final Admin adminClient = Admin.create(Map.of(
+                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, cluster.bootstrapServers()))) {
+                waitForGroupType(adminClient, GroupType.CLASSIC, applicationId);
+
+                // Join with the new protocol while the classic-protocol member is still alive.
+                streams.start();
+                waitForGroupType(adminClient, GroupType.STREAMS, applicationId);
+            }
+
+            TestUtils.waitForCondition(
+                () -> classicStreams.state() == KafkaStreams.State.RUNNING &&
+                    streams.state() == KafkaStreams.State.RUNNING,
+                30_000L,
+                "Both classic- and Streams-protocol clients should remain RUNNING during migration."
+            );
+
+            final long timestamp = cluster.time.milliseconds();
+            processKeyValueAndVerify(
+                "online-migration",
+                "B",
+                timestamp,
+                List.of(new KeyValueTimestamp<>("online-migration", "B", timestamp))
+            );
+
+            // Leaving with the native protocol should downgrade the group while the classic member remains alive.
+            streams.close(Duration.ofSeconds(30L));
+            streamsClosed = true;
+            try (final Admin adminClient = Admin.create(Map.of(
+                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, cluster.bootstrapServers()))) {
+                waitForGroupType(adminClient, GroupType.CLASSIC, applicationId);
+            }
+            TestUtils.waitForCondition(
+                () -> classicStreams.state() == KafkaStreams.State.RUNNING,
+                30_000L,
+                "The classic-protocol client should remain RUNNING after reverse migration."
+            );
+        } finally {
+            if (!streamsClosed) {
+                streams.close(Duration.ofSeconds(30L));
+            }
+            classicStreams.close(Duration.ofSeconds(30L));
+            streams.cleanUp();
+            classicStreams.cleanUp();
+        }
+    }
+
+    private void waitForGroupType(final Admin adminClient, final GroupType groupType, final String groupId)
+        throws InterruptedException {
+        TestUtils.waitForCondition(() -> {
+            try {
+                return adminClient.listGroups(new ListGroupsOptions().withTypes(Set.of(groupType)))
+                    .all()
+                    .get()
+                    .stream()
+                    .anyMatch(group -> group.groupId().equals(groupId));
+            } catch (final Exception e) {
+                return false;
+            }
+        }, 30_000L, "Expected group " + groupId + " to have type " + groupType + ".");
     }
 
     private void processExactlyOneRecord(

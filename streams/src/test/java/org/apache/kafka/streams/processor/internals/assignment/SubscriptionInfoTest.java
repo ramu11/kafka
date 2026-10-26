@@ -459,6 +459,28 @@ public class SubscriptionInfoTest {
     }
 
     @Test
+    public void shouldEncodeAndDecodeVersion12ProbingRebalanceInterval() {
+        final long probingIntervalMs = 123_456L;
+        final SubscriptionInfo info = new SubscriptionInfo(
+            12,
+            LATEST_SUPPORTED_VERSION,
+            PID_1,
+            "localhost:80",
+            TASK_OFFSET_SUMS,
+            IGNORED_UNIQUE_FIELD,
+            IGNORED_ERROR_CODE,
+            CLIENT_TAGS,
+            probingIntervalMs,
+            Map.of(TASK_1_1, 456L, TASK_2_0, Long.MAX_VALUE)
+        );
+        final SubscriptionInfo decoded = SubscriptionInfo.decode(info.encode());
+        assertEquals(12, decoded.version());
+        assertEquals(probingIntervalMs, decoded.probingRebalanceIntervalMs());
+        assertEquals(Map.of(TASK_1_1, 456L), decoded.taskEndOffsetSums());
+        assertEquals(info, decoded);
+    }
+
+    @Test
     public void shouldReturnEncodeDecodeEmptyClientTagsOnVersion11() {
         final SubscriptionInfo info =
             new SubscriptionInfo(11, LATEST_SUPPORTED_VERSION,

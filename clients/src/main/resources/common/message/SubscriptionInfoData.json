@@ -15,7 +15,7 @@
 
 {
   "name": "SubscriptionInfoData",
-  "validVersions": "1-11",
+  "validVersions": "1-12",
   "flexibleVersions": "none",
   "fields": [
     {
@@ -80,6 +80,19 @@
       "versions": "11+",
       "type": "[]ClientTag",
       "about": "The client tags that were assigned to the client."
+    },
+    {
+      "name": "taskEndOffsetSums",
+      "versions": "12+",
+      "type": "[]TaskOffsetSum",
+      "about": "Known changelog end-offset sums for tasks restored by the client; absent entries mean the end offset is unknown."
+    },
+    {
+      "name": "probingRebalanceIntervalMs",
+      "versions": "12+",
+      "default": "-1",
+      "type": "int64",
+      "about": "The classic Streams client's probing rebalance interval in milliseconds, or -1 when not present."
     }
   ],
   "commonStructs": [

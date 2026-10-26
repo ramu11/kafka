@@ -293,6 +293,19 @@ public class StreamsPartitionAssignor implements ConsumerPartitionAssignor, Conf
             filterMap(taskManager.taskOffsetSums(), t -> currentNamedTopologies.contains(t.getKey().topologyName())) :
             taskManager.taskOffsetSums();
 
+        final Map<TaskId, Long> taskEndOffsetSums = new HashMap<>();
+        if (!taskManager.topologyMetadata().hasNamedTopologies()) {
+            taskManager.taskEndOffsetSumSnapshot().forEach((taskId, offsetSum) -> {
+                // Long.MAX_VALUE means an end offset was missing or the sum overflowed; it is not a real end offset.
+                if (offsetSum != null && offsetSum >= 0L && offsetSum < Long.MAX_VALUE) {
+                    taskEndOffsetSums.put(
+                        new TaskId(Integer.parseInt(taskId.subtopologyId()), taskId.partitionId()),
+                        offsetSum
+                    );
+                }
+            });
+        }
+
         return new SubscriptionInfo(
             usedSubscriptionMetadataVersion,
             LATEST_SUPPORTED_VERSION,
@@ -301,7 +314,9 @@ public class StreamsPartitionAssignor implements ConsumerPartitionAssignor, Conf
             taskOffsetSums,
             uniqueField,
             assignmentErrorCode.get(),
-            clientTags
+            clientTags,
+            assignmentConfigs.probingRebalanceIntervalMs(),
+            taskEndOffsetSums
         ).encode();
     }
 
@@ -1525,6 +1540,7 @@ public class StreamsPartitionAssignor implements ConsumerPartitionAssignor, Conf
             case 9:
             case 10:
             case 11:
+            case 12:
                 validateActiveTaskEncoding(partitions, info, logPrefix);
 
                 activeTasks = getActiveTasks(partitions, info);

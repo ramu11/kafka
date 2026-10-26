@@ -16,16 +16,28 @@
  */
 package org.apache.kafka.coordinator.group;
 
+import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor;
+import org.apache.kafka.clients.consumer.internals.ConsumerProtocol;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.FencedInstanceIdException;
 import org.apache.kafka.common.errors.GroupMaxSizeReachedException;
+import org.apache.kafka.common.message.HeartbeatRequestData;
+import org.apache.kafka.common.message.HeartbeatResponseData;
+import org.apache.kafka.common.message.JoinGroupRequestData;
 import org.apache.kafka.common.message.StreamsGroupHeartbeatRequestData;
 import org.apache.kafka.common.message.StreamsGroupHeartbeatResponseData;
+import org.apache.kafka.common.message.SubscriptionInfoData;
+import org.apache.kafka.common.message.SubscriptionInfoData.TaskOffsetSum;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.protocol.MessageUtil;
 import org.apache.kafka.common.requests.StreamsGroupHeartbeatRequest;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorRecord;
 import org.apache.kafka.coordinator.common.runtime.CoordinatorResult;
 import org.apache.kafka.coordinator.common.runtime.MetadataImageBuilder;
 import org.apache.kafka.coordinator.common.runtime.MockCoordinatorTimer;
+import org.apache.kafka.coordinator.group.classic.ClassicGroup;
+import org.apache.kafka.coordinator.group.classic.ClassicGroupMember;
+import org.apache.kafka.coordinator.group.classic.ClassicGroupState;
 import org.apache.kafka.coordinator.group.streams.MockTaskAssignor;
 import org.apache.kafka.coordinator.group.streams.StreamsCoordinatorRecordHelpers;
 import org.apache.kafka.coordinator.group.streams.StreamsGroup;
@@ -40,9 +52,13 @@ import org.apache.kafka.coordinator.group.streams.assignor.AssignmentConfigsImpl
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 
 import static org.apache.kafka.common.requests.StreamsGroupHeartbeatRequest.LEAVE_GROUP_STATIC_MEMBER_EPOCH;
 import static org.apache.kafka.coordinator.group.Assertions.assertRecordsEquals;
@@ -64,6 +80,114 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class StreamsGroupMixedGroupMetadataManagerTest {
 
     private static final int DEFAULT_GROUP_EPOCH = 10;
+
+    @Test
+    public void testClassicStreamsGroupIsConvertedWhenStreamsMemberJoins() {
+        final String groupId = "classic-streams-migration";
+        final String memberId = "classic-member";
+        final UUID processId = UUID.fromString("c6f40ec4-a6b7-4d01-8f1f-7ad5782d1b4a");
+        final SubscriptionInfoData subscriptionInfo = new SubscriptionInfoData()
+            .setVersion(11)
+            .setLatestSupportedVersion(11)
+            .setProcessId(new Uuid(processId.getMostSignificantBits(), processId.getLeastSignificantBits()))
+            .setTaskOffsetSums(List.of(new TaskOffsetSum()
+                .setTopicGroupId(0)
+                .setPartition(1)
+                .setOffsetSum(-2L)
+                .setNamedTopology(null)));
+        final ByteBuffer userData = MessageUtil.toByteBufferAccessor(subscriptionInfo, (short) 11).buffer();
+        final ByteBuffer encodedSubscription = ConsumerProtocol.serializeSubscription(
+            new ConsumerPartitionAssignor.Subscription(List.of("input-topic"), userData));
+        final byte[] memberMetadata = new byte[encodedSubscription.remaining()];
+        encodedSubscription.get(memberMetadata);
+
+        final JoinGroupRequestData.JoinGroupRequestProtocolCollection protocols =
+            new JoinGroupRequestData.JoinGroupRequestProtocolCollection(1);
+        protocols.add(new JoinGroupRequestData.JoinGroupRequestProtocol()
+            .setName("stream")
+            .setMetadata(memberMetadata));
+        final ClassicGroupMember classicMember = new ClassicGroupMember(
+            memberId,
+            Optional.empty(),
+            "classic-client",
+            "127.0.0.1",
+            15000,
+            5000,
+            "consumer",
+            protocols
+        );
+
+        final GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder().build();
+        final ClassicGroup classicGroup = context.createClassicGroup(groupId);
+        classicGroup.add(classicMember);
+        classicGroup.transitionTo(ClassicGroupState.PREPARING_REBALANCE);
+        classicGroup.initNextGeneration();
+        classicGroup.transitionTo(ClassicGroupState.STABLE);
+
+        final List<CoordinatorRecord> records = new ArrayList<>();
+        final StreamsGroup streamsGroup = context.groupMetadataManager.getOrCreateStreamsGroup(groupId, records);
+
+        assertEquals(Group.GroupType.STREAMS, streamsGroup.type());
+        assertEquals(1, streamsGroup.groupEpoch());
+        assertEquals(Set.of(memberId), streamsGroup.members().keySet());
+        assertEquals(processId.toString(), streamsGroup.getMemberOrThrow(memberId).processId());
+        assertEquals(Map.of("0", Set.of(1)), streamsGroup.getMemberOrThrow(memberId).assignedTasks().activeTasks());
+        assertTrue(records.size() >= 4);
+    }
+
+    @Test
+    public void testClassicHeartbeatToStreamsGroupRequestsRebalanceWhenMemberEpochIsStale() {
+        final String groupId = "classic-streams-heartbeat-stale-epoch";
+        final String memberId = "classic-member";
+        final StreamsGroupMember member = streamsGroupMemberBuilderWithDefaults(memberId)
+            .setMemberEpoch(1)
+            .setPreviousMemberEpoch(0)
+            .setTopologyEpoch(-1)
+            .setClassicSessionTimeoutMs(5000)
+            .setClassicProtocolMetadata("migration-metadata-placeholder")
+            .build();
+
+        final GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder()
+            .withStreamsGroup(new StreamsGroupBuilder(groupId, 2)
+                .withMember(member)
+                .withTargetAssignmentEpoch(2))
+            .build();
+
+        final HeartbeatResponseData response = context.sendClassicGroupHeartbeat(new HeartbeatRequestData()
+            .setGroupId(groupId)
+            .setMemberId(memberId)
+            .setGenerationId(1)
+        ).response();
+
+        assertEquals(Errors.REBALANCE_IN_PROGRESS.code(), response.errorCode());
+    }
+
+    @Test
+    public void testClassicHeartbeatToStreamsGroupSucceedsWhenMemberEpochIsCurrent() {
+        final String groupId = "classic-streams-heartbeat-current-epoch";
+        final String memberId = "classic-member";
+        final StreamsGroupMember member = streamsGroupMemberBuilderWithDefaults(memberId)
+            .setMemberEpoch(2)
+            .setPreviousMemberEpoch(1)
+            .setTopologyEpoch(-1)
+            .setClassicSessionTimeoutMs(5000)
+            .setClassicProtocolMetadata("migration-metadata-placeholder")
+            .build();
+
+        final GroupMetadataManagerTestContext context = new GroupMetadataManagerTestContext.Builder()
+            .withStreamsGroup(new StreamsGroupBuilder(groupId, 2)
+                .withMember(member)
+                .withTargetAssignmentEpoch(2))
+            .build();
+
+        final HeartbeatResponseData response = context.sendClassicGroupHeartbeat(new HeartbeatRequestData()
+            .setGroupId(groupId)
+            .setMemberId(memberId)
+            .setGenerationId(2)
+        ).response();
+
+        assertEquals(Errors.NONE.code(), response.errorCode());
+    }
 
     @Test
     public void testDynamicJoinFailsAtMaxSizeWhileStaticMemberIsTemporarilyLeftAndDynamicMemberStillExists() {

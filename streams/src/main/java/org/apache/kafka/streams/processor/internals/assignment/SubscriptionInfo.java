@@ -17,13 +17,13 @@
 package org.apache.kafka.streams.processor.internals.assignment;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.SubscriptionInfoData;
+import org.apache.kafka.common.message.SubscriptionInfoData.ClientTag;
+import org.apache.kafka.common.message.SubscriptionInfoData.PartitionToOffsetSum;
+import org.apache.kafka.common.message.SubscriptionInfoData.TaskOffsetSum;
 import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.MessageUtil;
 import org.apache.kafka.streams.errors.TaskAssignmentException;
-import org.apache.kafka.streams.internals.generated.SubscriptionInfoData;
-import org.apache.kafka.streams.internals.generated.SubscriptionInfoData.ClientTag;
-import org.apache.kafka.streams.internals.generated.SubscriptionInfoData.PartitionToOffsetSum;
-import org.apache.kafka.streams.internals.generated.SubscriptionInfoData.TaskOffsetSum;
 import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.assignment.ProcessId;
 import org.apache.kafka.streams.processor.internals.Task;
@@ -63,7 +63,7 @@ public class SubscriptionInfo {
         final int subscriptionInfoLatestVersion = SubscriptionInfoData.HIGHEST_SUPPORTED_VERSION;
         if (subscriptionInfoLatestVersion != LATEST_SUPPORTED_VERSION) {
             throw new IllegalArgumentException(
-                "streams/src/main/resources/common/message/SubscriptionInfoData.json needs to be updated to match the " +
+                "clients/src/main/resources/common/message/SubscriptionInfoData.json needs to be updated to match the " +
                     "latest assignment protocol version. SubscriptionInfo only supports up to  ["
                     + subscriptionInfoLatestVersion + "] but needs to support up to [" + LATEST_SUPPORTED_VERSION + "].");
         }
@@ -90,6 +90,33 @@ public class SubscriptionInfo {
                             final byte uniqueField,
                             final int errorCode,
                             final Map<String, String> clientTags) {
+        this(version, latestSupportedVersion, processId, userEndPoint, taskOffsetSums,
+            uniqueField, errorCode, clientTags, -1L, Map.of());
+    }
+
+    public SubscriptionInfo(final int version,
+                            final int latestSupportedVersion,
+                            final ProcessId processId,
+                            final String userEndPoint,
+                            final Map<TaskId, Long> taskOffsetSums,
+                            final byte uniqueField,
+                            final int errorCode,
+                            final Map<String, String> clientTags,
+                            final long probingRebalanceIntervalMs) {
+        this(version, latestSupportedVersion, processId, userEndPoint, taskOffsetSums,
+            uniqueField, errorCode, clientTags, probingRebalanceIntervalMs, Map.of());
+    }
+
+    public SubscriptionInfo(final int version,
+                            final int latestSupportedVersion,
+                            final ProcessId processId,
+                            final String userEndPoint,
+                            final Map<TaskId, Long> taskOffsetSums,
+                            final byte uniqueField,
+                            final int errorCode,
+                            final Map<String, String> clientTags,
+                            final long probingRebalanceIntervalMs,
+                            final Map<TaskId, Long> taskEndOffsetSums) {
         validateVersions(version, latestSupportedVersion);
         final SubscriptionInfoData data = new SubscriptionInfoData();
         data.setVersion(version);
@@ -112,6 +139,20 @@ public class SubscriptionInfo {
         }
         if (version >= 11) {
             data.setClientTags(buildClientTagsFromMap(clientTags));
+        }
+        if (version >= 12) {
+            data.setProbingRebalanceIntervalMs(probingRebalanceIntervalMs);
+            data.setTaskEndOffsetSums(taskEndOffsetSums.entrySet().stream()
+                // Named topologies are deliberately unsupported by the classic migration bridge.
+                .filter(entry -> entry.getKey().topologyName() == null)
+                // Long.MAX_VALUE is the StateUpdater's unknown/overflow sentinel, not a usable end offset.
+                .filter(entry -> entry.getValue() >= 0L && entry.getValue() < Long.MAX_VALUE)
+                .map(entry -> new SubscriptionInfoData.TaskOffsetSum()
+                    .setTopicGroupId(entry.getKey().subtopology())
+                    .setPartition(entry.getKey().partition())
+                    .setOffsetSum(entry.getValue())
+                    .setNamedTopology(null))
+                .collect(Collectors.toList()));
         }
 
         this.data = data;
@@ -142,6 +183,35 @@ public class SubscriptionInfo {
 
     public int errorCode() {
         return data.errorCode();
+    }
+
+    public long probingRebalanceIntervalMs() {
+        return data.probingRebalanceIntervalMs();
+    }
+
+    /**
+     * Known cumulative changelog end-offset sums for tasks the StateUpdater is restoring. Missing entries and
+     * Long.MAX_VALUE (the StateUpdater's unknown/overflow sentinel) are intentionally not reported as end offsets.
+     */
+    public Map<TaskId, Long> taskEndOffsetSums() {
+        if (data.version() < 12 || data.taskEndOffsetSums() == null) {
+            return Map.of();
+        }
+        final Map<TaskId, Long> result = new HashMap<>();
+        for (final SubscriptionInfoData.TaskOffsetSum taskEndOffsetSum : data.taskEndOffsetSums()) {
+            if (taskEndOffsetSum.namedTopology() != null) {
+                throw new TaskAssignmentException("Named topologies are not compatible with the classic migration bridge");
+            }
+            final long value = taskEndOffsetSum.offsetSum();
+            if (value < 0L || value == Long.MAX_VALUE) {
+                continue;
+            }
+            final TaskId taskId = new TaskId(taskEndOffsetSum.topicGroupId(), taskEndOffsetSum.partition());
+            if (result.putIfAbsent(taskId, value) != null) {
+                throw new TaskAssignmentException("Duplicate task end-offset sum for task " + taskId);
+            }
+        }
+        return Map.copyOf(result);
     }
 
     private List<ClientTag> buildClientTagsFromMap(final Map<String, String> clientTags) {

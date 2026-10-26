@@ -54,6 +54,10 @@ import java.util.stream.Collectors;
  * @param clientTags                    Tags of the client of the member used for rack-aware assignment.
  * @param assignedTasks                 Tasks assigned to the member, including assignment epochs for active tasks.
  * @param tasksPendingRevocation        Tasks owned by the member pending revocation, including assignment epochs for active tasks.
+ * @param classicSessionTimeoutMs        The classic protocol session timeout retained for reverse migration.
+ * @param classicProtocolMetadata        The classic Streams subscription metadata retained for reverse migration.
+ * @param classicProbingRebalanceEpoch    The last assignment epoch in which a probing rebalance was requested.
+ * @param classicProbingRebalancePending  Whether a coordinator-triggered probing rebalance is awaiting JoinGroup.
  */
 @SuppressWarnings("checkstyle:JavaNCSS")
 public record StreamsGroupMember(String memberId,
@@ -70,7 +74,65 @@ public record StreamsGroupMember(String memberId,
                                  Optional<StreamsGroupMemberMetadataValue.Endpoint> userEndpoint,
                                  Map<String, String> clientTags,
                                  TasksTupleWithEpochs assignedTasks,
-                                 TasksTupleWithEpochs tasksPendingRevocation) {
+                                 TasksTupleWithEpochs tasksPendingRevocation,
+                                 Integer classicSessionTimeoutMs,
+                                 String classicProtocolMetadata,
+                                 int classicProbingRebalanceEpoch,
+                                 boolean classicProbingRebalancePending) {
+
+    /**
+     * Compatibility constructor for callers that do not carry classic-protocol migration metadata.
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    public StreamsGroupMember(
+        String memberId,
+        Integer memberEpoch,
+        Integer previousMemberEpoch,
+        MemberState state,
+        Optional<String> instanceId,
+        Optional<String> rackId,
+        String clientId,
+        String clientHost,
+        Integer rebalanceTimeoutMs,
+        Integer topologyEpoch,
+        String processId,
+        Optional<StreamsGroupMemberMetadataValue.Endpoint> userEndpoint,
+        Map<String, String> clientTags,
+        TasksTupleWithEpochs assignedTasks,
+        TasksTupleWithEpochs tasksPendingRevocation
+    ) {
+        this(memberId, memberEpoch, previousMemberEpoch, state, instanceId, rackId, clientId, clientHost,
+            rebalanceTimeoutMs, topologyEpoch, processId, userEndpoint, clientTags, assignedTasks,
+            tasksPendingRevocation, -1, null, -1, false);
+    }
+
+    /**
+     * Compatibility constructor for callers that carry classic migration metadata but predate probing state.
+     */
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    public StreamsGroupMember(
+        String memberId,
+        Integer memberEpoch,
+        Integer previousMemberEpoch,
+        MemberState state,
+        Optional<String> instanceId,
+        Optional<String> rackId,
+        String clientId,
+        String clientHost,
+        Integer rebalanceTimeoutMs,
+        Integer topologyEpoch,
+        String processId,
+        Optional<StreamsGroupMemberMetadataValue.Endpoint> userEndpoint,
+        Map<String, String> clientTags,
+        TasksTupleWithEpochs assignedTasks,
+        TasksTupleWithEpochs tasksPendingRevocation,
+        Integer classicSessionTimeoutMs,
+        String classicProtocolMetadata
+    ) {
+        this(memberId, memberEpoch, previousMemberEpoch, state, instanceId, rackId, clientId, clientHost,
+            rebalanceTimeoutMs, topologyEpoch, processId, userEndpoint, clientTags, assignedTasks,
+            tasksPendingRevocation, classicSessionTimeoutMs, classicProtocolMetadata, -1, false);
+    }
 
     public StreamsGroupMember {
         Objects.requireNonNull(memberId, "memberId cannot be null");
@@ -99,6 +161,10 @@ public record StreamsGroupMember(String memberId,
         private Map<String, String> clientTags = null;
         private TasksTupleWithEpochs assignedTasks = null;
         private TasksTupleWithEpochs tasksPendingRevocation = null;
+        private Integer classicSessionTimeoutMs = -1;
+        private String classicProtocolMetadata = null;
+        private int classicProbingRebalanceEpoch = -1;
+        private boolean classicProbingRebalancePending = false;
 
         public Builder(String memberId) {
             this.memberId = Objects.requireNonNull(memberId, "memberId cannot be null");
@@ -126,6 +192,10 @@ public record StreamsGroupMember(String memberId,
             this.state = member.state;
             this.assignedTasks = member.assignedTasks;
             this.tasksPendingRevocation = member.tasksPendingRevocation;
+            this.classicSessionTimeoutMs = member.classicSessionTimeoutMs;
+            this.classicProtocolMetadata = member.classicProtocolMetadata;
+            this.classicProbingRebalanceEpoch = member.classicProbingRebalanceEpoch;
+            this.classicProbingRebalancePending = member.classicProbingRebalancePending;
         }
 
         public Builder updateMemberEpoch(int memberEpoch) {
@@ -230,6 +300,26 @@ public record StreamsGroupMember(String memberId,
             return this;
         }
 
+        public Builder setClassicSessionTimeoutMs(Integer classicSessionTimeoutMs) {
+            this.classicSessionTimeoutMs = classicSessionTimeoutMs;
+            return this;
+        }
+
+        public Builder setClassicProtocolMetadata(String classicProtocolMetadata) {
+            this.classicProtocolMetadata = classicProtocolMetadata;
+            return this;
+        }
+
+        public Builder setClassicProbingRebalanceEpoch(int classicProbingRebalanceEpoch) {
+            this.classicProbingRebalanceEpoch = classicProbingRebalanceEpoch;
+            return this;
+        }
+
+        public Builder setClassicProbingRebalancePending(boolean classicProbingRebalancePending) {
+            this.classicProbingRebalancePending = classicProbingRebalancePending;
+            return this;
+        }
+
         public Builder setAssignedTasks(TasksTupleWithEpochs assignedTasks) {
             this.assignedTasks = assignedTasks;
             return this;
@@ -246,6 +336,10 @@ public record StreamsGroupMember(String memberId,
             setClientId(record.clientId());
             setClientHost(record.clientHost());
             setRebalanceTimeoutMs(record.rebalanceTimeoutMs());
+            setClassicSessionTimeoutMs(record.classicSessionTimeoutMs());
+            setClassicProtocolMetadata(record.classicProtocolMetadata());
+            setClassicProbingRebalanceEpoch(record.classicProbingRebalanceEpoch());
+            setClassicProbingRebalancePending(record.classicProbingRebalancePending());
             setTopologyEpoch(record.topologyEpoch());
             setProcessId(record.processId());
             setUserEndpoint(record.userEndpoint());
@@ -298,6 +392,8 @@ public record StreamsGroupMember(String memberId,
                 .setPreviousMemberEpoch(0)
                 .setAssignedTasks(TasksTupleWithEpochs.EMPTY)
                 .setTasksPendingRevocation(TasksTupleWithEpochs.EMPTY)
+                .setClassicSessionTimeoutMs(-1)
+                .setClassicProtocolMetadata(null)
                 .setUserEndpoint(null);
         }
 
@@ -317,7 +413,11 @@ public record StreamsGroupMember(String memberId,
                 userEndpoint,
                 clientTags,
                 assignedTasks,
-                tasksPendingRevocation
+                tasksPendingRevocation,
+                classicSessionTimeoutMs,
+                classicProtocolMetadata,
+                classicProbingRebalanceEpoch,
+                classicProbingRebalancePending
             );
         }
 

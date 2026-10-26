@@ -210,6 +210,17 @@ public class AssignmentInfoTest {
     }
 
     @Test
+    public void shouldEncodeAndDecodeVersion12WithNextRebalanceTime() {
+        final AssignmentInfo info = new AssignmentInfo(
+            12, activeTasks, standbyTasks, activeAssignment, standbyAssignment, 0);
+        info.setNextRebalanceTime(123_456L);
+
+        final AssignmentInfo decoded = AssignmentInfo.decode(info.encode());
+        assertEquals(info, decoded);
+        assertEquals(123_456L, decoded.nextRebalanceMs());
+    }
+
+    @Test
     public void shouldEncodeAndDecodeSmallerCommonlySupportedVersion() {
         final int usedVersion = 5;
         final int commonlySupportedVersion = 5;
